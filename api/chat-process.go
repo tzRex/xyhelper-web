@@ -1,7 +1,9 @@
 package api
 
 import (
+	"fmt"
 	"io"
+	"net/http"
 	"time"
 	chatresponse "xyhelper-web/chat-response"
 	"xyhelper-web/config"
@@ -34,6 +36,7 @@ type ChatProcessResponse struct {
 	ParentMessageId string `json:"parentMessageId"` // 父消息ID
 	ConversationId  string `json:"conversationId"`  // 会话ID
 	Text            string `json:"text"`            // 消息内容
+	FinishType      string `json:"finishType"`      // 结束类型
 }
 
 type Message struct {
@@ -68,23 +71,23 @@ type ConversationReq struct {
 
 func ChatProcess(r *ghttp.Request) {
 	ctx := r.Context()
-	if config.WeChatServer != "" {
-		wxOpenId, err := r.Session.Get("wxOpenId")
-		if err != nil {
-			r.Response.WriteJsonExit(g.Map{
-				"status":  "Error",
-				"message": "请先登录",
-				"data":    nil,
-			})
-		}
-		if wxOpenId.String() == "" {
-			r.Response.WriteJsonExit(g.Map{
-				"status":  "Unauthorized",
-				"message": "登陆失效，请重新登陆",
-				"data":    nil,
-			})
-		}
-	}
+	// if config.WeChatServer != "" {
+	// 	wxOpenId, err := r.Session.Get("wxOpenId")
+	// 	if err != nil {
+	// 		r.Response.WriteJsonExit(g.Map{
+	// 			"status":  "Error",
+	// 			"message": "请先登录",
+	// 			"data":    nil,
+	// 		})
+	// 	}
+	// 	if wxOpenId.String() == "" {
+	// 		r.Response.WriteJsonExit(g.Map{
+	// 			"status":  "Unauthorized",
+	// 			"message": "登陆失效，请重新登陆",
+	// 			"data":    nil,
+	// 		})
+	// 	}
+	// }
 	var req *ChatProcessRequest
 	if err := r.Parse(&req); err != nil {
 		r.Response.WriteJsonExit(g.Map{
@@ -122,7 +125,15 @@ func ChatProcess(r *ghttp.Request) {
 	client := g.Client()
 	client.SetHeader("Authorization", "Bearer "+req.AccessToken)
 	client.SetHeader("Content-Type", "application/json")
-	response, err := client.Post(ctx, req.BaseURI+"/backend-api/conversation", conversationReq)
+	baseURI := req.BaseURI
+	if config.BaseURI != "" {
+		baseURI = config.BaseURI
+	}
+	if config.AccessToken != "" {
+		client.SetHeader("Authorization", "Bearer "+config.AccessToken)
+	}
+
+	response, err := client.Post(ctx, baseURI+"/backend-api/conversation", conversationReq)
 	if err != nil {
 		r.Response.WriteJsonExit(g.Map{
 			"status":  "Error",
@@ -133,11 +144,12 @@ func ChatProcess(r *ghttp.Request) {
 	defer response.Close()
 	// 如果返回404，去掉会话ID，重新请求
 	if response.StatusCode == 404 {
+		g.Log().Error(ctx, "会话ID不存在，重新请求")
 		// 延时5秒
 		time.Sleep(5 * time.Second)
 
 		conversationReq.ConversationID = ""
-		response, err = client.Post(ctx, req.BaseURI+"/backend-api/conversation", conversationReq)
+		response, err = client.Post(ctx, baseURI+"/backend-api/conversation", conversationReq)
 		if err != nil {
 			r.Response.WriteJsonExit(g.Map{
 				"status":  "Error",
@@ -147,12 +159,43 @@ func ChatProcess(r *ghttp.Request) {
 		}
 		defer response.Close()
 	}
+	if response.StatusCode == 501 {
+		r.Response.WriteJsonExit(g.Map{
+			"status":  "Error",
+			"message": "当前用户不支持使用该模型,请联系客服购买会员",
+			"data":    nil,
+		})
+	}
+	if response.StatusCode == 429 {
+		r.Response.WriteJsonExit(g.Map{
+			"status":  "Error",
+			"message": "请求失败" + response.Status + ", 当前请求过多，请稍后再试,或新建聊天窗口",
+			"data":    nil,
+		})
+	}
+	if response.StatusCode == 413 {
+		r.Response.WriteJsonExit(g.Map{
+			"status":  "Error",
+			"message": "请求失败" + response.Status + ", 请求内容过长，请重新输入",
+			"data":    nil,
+		})
+	}
+
 	if response.StatusCode != 200 {
 		r.Response.WriteJsonExit(g.Map{
 			"status":  "Error",
-			"message": "请求失败" + response.Status,
+			"message": "请求失败" + response.Status + ", 请联系客服",
 			"data":    nil,
 		})
+	}
+
+	//  流式回应
+	rw := r.Response.RawWriter()
+	flusher, ok := rw.(http.Flusher)
+	if !ok {
+		g.Log().Error(ctx, "rw.(http.Flusher) error")
+		r.Response.WriteStatusExit(500)
+		return
 	}
 	// r.Response.Header().Set("Content-Type", "text/event-stream")
 	r.Response.Header().Set("Cache-Control", "no-cache")
@@ -178,6 +221,7 @@ func ChatProcess(r *ghttp.Request) {
 		if err != nil {
 			continue
 		}
+		// g.Log().Debug(ctx, "chatResponse", chatResponse)
 		if chatResponse.Message.Author.Role != "assistant" {
 			continue
 		}
@@ -187,15 +231,17 @@ func ChatProcess(r *ghttp.Request) {
 			ParentMessageId: req.Optins.ParentMessageId,
 			ConversationId:  chatResponse.ConversationID,
 			Text:            chatResponse.Message.Content.Parts[0],
+			FinishType:      chatResponse.Message.Metadata.FinishDetails.Type,
 		}
-
-		r.Response.Writefln("%s", gjson.New(message).MustToJson())
-		r.Response.Flush()
-		// g.Log().Debug(ctx, "event.Data", text)
 		// g.Log().Debug(ctx, "message", message)
+
+		_, err = fmt.Fprintf(rw, "%s\n", gjson.New(message).String())
+		if err != nil {
+			g.Log().Error(ctx, "fmt.Fprintf error", err)
+			response.Body.Close()
+			continue
+		}
+		flusher.Flush()
 	}
-	// 输出 [DONE] 信息
-	// r.Response.Writefln("data: %s]\n\n", "[DONE]")
-	// r.Response.Flush()
 
 }
